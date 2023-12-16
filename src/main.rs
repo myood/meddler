@@ -9,29 +9,68 @@ use windows_service::{
     service_control_handler::{ServiceStatusHandle, ServiceControlHandlerResult}
 };
 
+use std::sync::Mutex;
+use willhook::hook::Hook;
+static PROTECTED_WILLHOOK: Mutex<Option<Hook>> = Mutex::new(None);
+static PROTECTED_SERVICE_HANDLE: Mutex<Option<ServiceStatusHandle>> = Mutex::new(None);
+
 define_windows_service!(ffi_service_main, meddler_service);
+#[derive(Clone, Copy)]
+enum MeddlerErrorCodes {
+    WillhookHandleInvalid = 0x1,
+    WillhookHandleAccessError = 0x2,
+    ServiceHandleInvalid = 0x3,
+}
 
-fn service_control(service_control: ServiceControl) -> ServiceControlHandlerResult {
-    // TODO: REPORT BASED ON PROTECTED_STATUS_HANDLE as well
-    // TODO: SIMPLIFY if-statement using default_or
-
-    let is_running = if let Ok(willhook_guard) = PROTECTED_WILLHOOK.lock() {
+fn get_willhook_status() -> bool {
+    if let Ok(willhook_guard) = PROTECTED_WILLHOOK.lock() {
         if let Some(_) = *willhook_guard {
-            ServiceControlHandlerResult::NoError
-        }
-        else {
-            // There is no willhook handle.
-            ServiceControlHandlerResult::Other(0x2)
+            return true
         }
     }
-    else {
-        // Failed to unlock mutex.
-        ServiceControlHandlerResult::Other(0x1)
-    };
+    
+    false
+}
 
+fn get_service_handle_status() -> bool {
+    if let Ok(willhook_guard) = PROTECTED_WILLHOOK.lock() {
+        if let Some(_) = *willhook_guard {
+            return true
+        }
+    }
+    
+    false
+}
+
+fn get_service_status() -> ServiceControlHandlerResult {
+    let willhook_status = get_willhook_status();
+    if !willhook_status
+    {
+        return ServiceControlHandlerResult::Other(MeddlerErrorCodes::WillhookHandleInvalid as u32)
+    }
+
+    let service_handle_status = get_service_handle_status();
+    if !service_handle_status
+    {
+        return ServiceControlHandlerResult::Other(MeddlerErrorCodes::ServiceHandleInvalid as u32)
+    }
+
+    ServiceControlHandlerResult::NoError
+}
+
+fn stop_service() -> ServiceControlHandlerResult {
+    if let Ok(mut willhook_guard) = PROTECTED_WILLHOOK.lock() {
+        *willhook_guard = None;
+        return ServiceControlHandlerResult::NoError
+    }
+    
+    ServiceControlHandlerResult::Other(MeddlerErrorCodes::WillhookHandleAccessError as u32)
+}
+
+fn service_control(service_control: ServiceControl) -> ServiceControlHandlerResult {
     match service_control {
-        ServiceControl::Interrogate => is_running,
-        ServiceControl::Stop => ServiceControlHandlerResult::NoError,
+        ServiceControl::Interrogate => get_service_status(),
+        ServiceControl::Stop => stop_service(),
         _ => ServiceControlHandlerResult::NotImplemented,
     }
 }
@@ -58,22 +97,19 @@ fn report_service_state(handle: &ServiceStatusHandle, state: ServiceState) -> Re
     handle.set_service_status(next_status)
 }
 
-use std::sync::Mutex;
-use willhook::hook::Hook;
-static PROTECTED_WILLHOOK: Mutex<Option<Hook>> = Mutex::new(None);
-static PROTECTED_SERVICE_HANDLE: Mutex<Option<ServiceStatusHandle>> = Mutex::new(None);
 
 fn meddler_service(_arguments: Vec<OsString>) {
     if let Ok(status_handle) = windows_service::service_control_handler::register("Meddler", service_control) {
-        // TODO: ASSIGN STATUS HANDLE TO PROTECTED_SERVICE_HANDLE
-
+        if let Ok(mut service_handle) = PROTECTED_SERVICE_HANDLE.lock() {
+            *service_handle = Some(status_handle)
+        }
 
         if let Ok(mut willhook_guard) = PROTECTED_WILLHOOK.lock() {
             *willhook_guard = willhook::willhook();
             match *willhook_guard {
                 Some(_) => report_service_state(&status_handle, ServiceState::Running).unwrap(),
                 _ => report_service_state(&status_handle, ServiceState::Stopped).unwrap()
-            }   
+            }
         }
     }
 }
